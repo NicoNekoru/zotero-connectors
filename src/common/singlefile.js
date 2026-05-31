@@ -25,6 +25,26 @@
 
 const FETCH_REQUEST_EVENT = "single-file-request-fetch";
 const FETCH_RESPONSE_EVENT = "single-file-response-fetch";
+const SEMANTIC_SCHOLAR_HOST_PATTERN = /(?:^|\.)semanticscholar\.org$/i;
+
+function isSemanticScholarURL(urlString) {
+	try {
+		return SEMANTIC_SCHOLAR_HOST_PATTERN.test(new URL(urlString).hostname);
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+function getSingleFileOptionsForURL(urlString) {
+	if (isSemanticScholarURL(urlString)) {
+		return {
+			blockImages: true,
+			loadDeferredImages: false
+		};
+	}
+	return {};
+}
 
 Zotero.SingleFile = {
 	_hooksInjected: false,
@@ -81,7 +101,11 @@ Zotero.SingleFile = {
 		});
 	},
 	
-	retrievePageData: async function() {
+	retrievePageData: async function({ url = document.location.href, ...options } = {}) {
+		let singleFileOptions = Object.assign(
+			getSingleFileOptionsForURL(url),
+			options
+		);
 		if (!this._hooksInjected) {
 			await this._injectSingleFileHooks();
 			this._hooksInjected = true;
@@ -98,7 +122,7 @@ Zotero.SingleFile = {
 
 			Zotero.debug("SingleFile: Retrieving page data");
 			if (Zotero.Inject.notification) Zotero.Inject.notification.dismiss()
-			let pageData = await singlefile.getPageData(Zotero.SingleFile.CONFIG, {
+			let pageData = await singlefile.getPageData(Object.assign({}, Zotero.SingleFile.CONFIG, singleFileOptions), {
 				fetch: (...args) => Zotero.SingleFile.singleFileFetch(...args)
 			});
 			Zotero.debug("SingleFile: Done retrieving page data");

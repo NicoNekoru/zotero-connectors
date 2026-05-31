@@ -66,7 +66,7 @@ Zotero.Connector_Browser = new function() {
 				let tabs = await browser.tabs.query({});
 				for (let tab of tabs) {
 					// Remove cached tabInfo for tabs that are no longer open every 15 minutes
-					if (!tab.id in _tabInfo) {
+					if (!(tab.id in _tabInfo)) {
 						_clearInfoForTab(tab.id)
 					}
 				}
@@ -142,11 +142,23 @@ Zotero.Connector_Browser = new function() {
 		let tabInfo = this.getTabInfo(tab.id);
 
 		let existingTranslators = tabInfo.translators;
+		if (!translators.length) {
+			// If the top frame reports no translators, clear stale top-level state
+			// so we can recover from stale background caches.
+			if (frameId == 0) {
+				_tabInfo[tab.id] = Object.assign(_tabInfo[tab.id] || {}, {
+					translators: [],
+					instanceID: null,
+					isPDF: false
+				});
+				Zotero.Connector_Browser._updateExtensionUI(tab);
+			}
+			return;
+		}
+
 		// If translators already exist for tab we need to figure out if the new translators
 		// are more important/higher priority
 		if (existingTranslators) {
-			if (!translators.length) return;
-			
 			if (existingTranslators.length) {
 				let existingTranslatorsHaveHigherPriority = existingTranslators[0].priority < translators[0].priority;
 				if (existingTranslatorsHaveHigherPriority) return;
@@ -154,7 +166,7 @@ Zotero.Connector_Browser = new function() {
 				let priorityEqual = translators[0].priority == existingTranslators[0].priority;
 				let newTranslatorsAreFromTopFrame = frameId == 0;
 				if (priorityEqual && !newTranslatorsAreFromTopFrame) return;
-			}	
+			}
 		}
 		
 		var isPDF = contentType == 'application/pdf';
@@ -1057,6 +1069,7 @@ Zotero.Connector_Browser = new function() {
 		if (!shouldContinue) {
 			return;
 		}
+		tab = await _refreshContextForAction(tab);
 
 		let tabInfo = Zotero.Connector_Browser.getTabInfo(tab.id);
 		if (_isBetaBuildBeyondExpiration) {
@@ -1089,6 +1102,34 @@ Zotero.Connector_Browser = new function() {
 		}
 	}
 
+	async function _refreshContextForAction(tab) {
+		if (!tab || tab.id === -1) {
+			tab = await getCurrentTab();
+		} else {
+			try {
+				tab = await browser.tabs.get(tab.id);
+			} catch (e) {}
+		}
+		if (!tab) {
+			return tab;
+		}
+
+		let tabInfo = Zotero.Connector_Browser.getTabInfo(tab.id);
+		if (tabInfo.url !== tab.url) {
+			Zotero.debug(`Connector_Browser: Refreshing stale state for tab ${tab.id} (${tabInfo.url} -> ${tab.url})`);
+			tabInfo = Zotero.Connector_Browser.resetTabInfo(tab.id);
+			tabInfo.url = tab.url;
+		}
+
+		try {
+			// Ensure fresh top-frame scripts and trigger translator detection.
+			await Zotero.Connector_Browser.injectTranslationScripts(tab, 0, tab.url);
+			await Zotero.Messaging.sendMessage("refreshTranslators", [true], tab, 0);
+		} catch (e) {}
+
+		return tab;
+	}
+
 	/**
 	 * @param tab <Tab>
 	 * @param i <Integer> the index of translator to save with
@@ -1097,9 +1138,27 @@ Zotero.Connector_Browser = new function() {
 	 * 		- note <String> add string as a note to the saved item
 	 * @returns {Promise<*>}
 	 */
-	this.saveWithTranslator = function(tab, i, options={}) {
+	this.saveWithTranslator = async function(tab, i, options={}) {
+		tab = await _refreshContextForAction(tab);
+		if (!tab) return;
+
+		let translatorIdx = Number(i);
+		if (!Number.isInteger(translatorIdx) || translatorIdx < 0) {
+			translatorIdx = 0;
+		}
+		
 		let tabInfo = this.getTabInfo(tab.id);
-		var translator = tabInfo.translators[i];
+		let translator = tabInfo.translators ? tabInfo.translators[translatorIdx] : undefined;
+		if (!translator) {
+			await _refreshContextForAction(tab);
+			tabInfo = this.getTabInfo(tab.id);
+			translator = tabInfo.translators ? tabInfo.translators[translatorIdx] : undefined;
+		}
+		if (!translator) {
+			let withSnapshot = Zotero.Connector.isOnline ? Zotero.Connector.prefs.automaticSnapshots :
+				Zotero.Prefs.get('automaticSnapshots');
+			return Zotero.Connector_Browser.saveAsWebpage(tab, 0, { snapshot: withSnapshot });
+		}
 		
 		// Set frameId to null - send message to all frames
 		// There is code to figure out which frame should translate with instanceID.

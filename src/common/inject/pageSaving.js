@@ -29,6 +29,132 @@ const SITE_ACCESS_LIMIT_TRANSLATORS = new Set([
 	"57a00950-f0d1-4b41-b6ba-44ff0fc30289" // GoogleScholar
 ]);
 
+function isArxivPdfUrl(url) {
+	return /^https?:\/\/(?:www\.)?arxiv\.org\/pdf\//i.test(url || '');
+}
+
+function normalizeArxivPdfUrl(candidate, original = document.location.href) {
+	let value = `${candidate}`.trim();
+	if (!value) return null;
+	if (!value.startsWith('http://') && !value.startsWith('https://')) {
+		if (value.startsWith('//')) {
+			value = `https:${value}`;
+		}
+		else {
+			try {
+				value = new URL(value, original).href;
+			}
+			catch (e) {}
+		}
+	}
+	try {
+		const parsedUrl = new URL(value);
+		if (/arxiv\.org\/abs\//i.test(parsedUrl.pathname)) {
+			const arxivId = parsedUrl.pathname.replace(/^\/abs\//i, '').split(/[/?#]/)[0];
+			if (arxivId) {
+				value = `${parsedUrl.origin}/pdf/${arxivId}.pdf`;
+			}
+		}
+	}
+	catch (e) {}
+	return isArxivPdfUrl(value) ? value : null;
+}
+
+function normalizeSemanticScholarTitle(title) {
+	return (title || '')
+		.toLowerCase()
+		.replace(/\\beta|β/g, ' beta ')
+		.replace(/[\s:;,.!?'"()[\]{}$\\-]+/g, ' ')
+		.trim();
+}
+
+function isSemanticScholarTitleMatch(sourceTitle, candidateTitle) {
+	const source = normalizeSemanticScholarTitle(sourceTitle);
+	const candidate = normalizeSemanticScholarTitle(candidateTitle);
+	if (!source || !candidate) return false;
+	if (source === candidate) return true;
+	if (source.length < 20) return false;
+	return candidate.startsWith(source + ' ') || source.startsWith(candidate + ' ');
+}
+
+function getSemanticScholarTitleFromDoc(doc) {
+	for (let script of doc.querySelectorAll('script.schema-data, script[type="application/ld+json"]')) {
+		try {
+			const data = JSON.parse(script.textContent || '');
+			const article = data['@graph'] && data['@graph'][1] && data['@graph'][1][0];
+			if (article && article.name) {
+				return article.name;
+			}
+			if (data.name) {
+				return data.name;
+			}
+		}
+		catch (e) {}
+	}
+
+	const citationTitle = doc.querySelector('meta[name="citation_title"]');
+	if (citationTitle && citationTitle.content) {
+		return citationTitle.content;
+	}
+
+	return doc.title.replace(/\s*\|\s*Semantic Scholar\s*$/i, '');
+}
+
+async function getSemanticScholarArxivPdfFromTitle(title) {
+	if (!title) return null;
+
+	const apiURL = `https://export.arxiv.org/api/query?search_query=ti:${encodeURIComponent(`"${title}"`)}&start=0&max_results=5`;
+	try {
+		const xhr = await Zotero.COHTTP.request("GET", apiURL, { responseType: 'text' });
+		const parser = new DOMParser();
+		const arxivDoc = parser.parseFromString(xhr.responseText, 'application/xml');
+		for (let entry of arxivDoc.querySelectorAll('entry')) {
+			const titleElement = entry.querySelector('title');
+			if (!isSemanticScholarTitleMatch(title, titleElement && titleElement.textContent)) continue;
+
+			const pdfLink = entry.querySelector('link[title="pdf"][href]');
+			if (pdfLink) {
+				return normalizeArxivPdfUrl(pdfLink.getAttribute('href'), apiURL);
+			}
+
+			const idElement = entry.querySelector('id');
+			return normalizeArxivPdfUrl(idElement && idElement.textContent, apiURL);
+		}
+	}
+	catch (e) {
+		Zotero.debug(`Semantic Scholar arXiv title lookup failed: ${e}`);
+	}
+	return null;
+}
+
+async function getBestSemanticScholarPdfFromDoc(doc) {
+	const url = await getSemanticScholarArxivPdfFromTitle(getSemanticScholarTitleFromDoc(doc));
+	return url ? { url } : null;
+}
+
+function mergePdfAttachment(item, targetPdf) {
+	if (!targetPdf || !targetPdf.url) return;
+	item.attachments = item.attachments || [];
+	const existingPdf = item.attachments.find(a => a.mimeType === 'application/pdf');
+	if (existingPdf && isArxivPdfUrl(existingPdf.url)) {
+		return;
+	}
+
+	if (existingPdf) {
+		item.attachments = item.attachments.filter((attachment) => attachment.mimeType !== 'application/pdf');
+	}
+
+	item.attachments.push({
+		title: 'Full Text PDF',
+		mimeType: 'application/pdf',
+		url: targetPdf.url
+	});
+}
+
+function isSemanticScholarContext(url) {
+	return /^https?:\/\/(?:www\.)?semanticscholar\.org\/(?:paper|reader)\//i.test(url || '');
+}
+
 function determineAttachmentIcon(attachment) {
 	if(attachment.linkMode === "linked_url") {
 		return Zotero.ItemTypes.getImageSrc("attachment-web-link");
@@ -301,6 +427,19 @@ let PageSaving = {
 			if (proxy) proxy = new Zotero.Proxy(proxy);
 		}
 		items = this._processNote(items);
+		if (
+			isSemanticScholarContext(document.location.href) &&
+			translators[0].itemType !== 'multiple' &&
+			items && items.length
+		) {
+			const bestPdf = await getBestSemanticScholarPdfFromDoc(document);
+			if (bestPdf) {
+				for (let item of items) {
+					if (!item.attachments) item.attachments = [];
+					mergePdfAttachment(item, bestPdf);
+				}
+			}
+		}
 		this.sessionDetails.items = items;
 		let itemType = translators[0].itemType;
 		let itemSaver = new Zotero.ItemSaver({ sessionID, itemType, baseURI: document.location.href, proxy });
@@ -432,7 +571,9 @@ let PageSaving = {
 
 			Zotero.Messaging.sendMessage("progressWindow.itemProgress", snapshotItem);
 
-			const snapshotContent = await Zotero.SingleFile.retrievePageData();
+			const snapshotContent = await Zotero.SingleFile.retrievePageData({
+				url: data.url
+			});
 
 			if (toServer) {
 				snapshotItem.data = snapshotContent;
@@ -698,3 +839,10 @@ let PageSaving = {
 }
 
 Zotero.PageSaving = PageSaving;
+
+if (Zotero.Messaging && typeof Zotero.Messaging.addMessageListener === 'function') {
+	Zotero.Messaging.addMessageListener("refreshTranslators", function(args) {
+		let force = !args || args[0] !== false;
+		return Zotero.PageSaving.onPageLoad(force);
+	});
+}
