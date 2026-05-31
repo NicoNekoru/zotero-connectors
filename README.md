@@ -1,6 +1,6 @@
 # Zotero Connectors
 
-[![Build Status](https://travis-ci.org/zotero/zotero-connectors.svg?branch=master)](https://travis-ci.org/zotero/zotero-connectors)
+For my ad-hoc use of Zotero connector I want better reliability for PDF saving and in generality. I also will hardcode better interactions with semanticscholar. In general, there should be more site-specific customizability of behaviour/interaction.
 
 ## Building
 
